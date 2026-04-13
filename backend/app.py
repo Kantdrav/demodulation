@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import librosa
@@ -67,8 +68,34 @@ def pad_or_truncate(mfcc: np.ndarray, max_len: int) -> np.ndarray:
     return mfcc
 
 
-def preprocess_audio_bytes(audio_bytes: bytes) -> np.ndarray:
-    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=SAMPLE_RATE, mono=True)
+def decode_audio_bytes(audio_bytes: bytes, filename: str | None = None) -> tuple[np.ndarray, int]:
+    if not audio_bytes:
+        raise ValueError("Empty or invalid audio")
+
+    # Try in-memory decoding first (fast path for wav/flac/ogg).
+    try:
+        return librosa.load(io.BytesIO(audio_bytes), sr=SAMPLE_RATE, mono=True)
+    except Exception:
+        pass
+
+    suffix = Path(filename or "").suffix.lower() or ".tmp"
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(audio_bytes)
+            temp_path = tmp.name
+        return librosa.load(temp_path, sr=SAMPLE_RATE, mono=True)
+    except Exception as exc:
+        raise ValueError(
+            "Unsupported or corrupted audio format. Upload WAV/MP3/M4A/FLAC/OGG."
+        ) from exc
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def preprocess_audio_bytes(audio_bytes: bytes, filename: str | None = None) -> np.ndarray:
+    y, sr = decode_audio_bytes(audio_bytes, filename)
     if y.size == 0:
         raise ValueError("Empty or invalid audio")
 
@@ -80,8 +107,8 @@ def preprocess_audio_bytes(audio_bytes: bytes) -> np.ndarray:
     return x
 
 
-def denoise_audio_bytes(audio_bytes: bytes) -> io.BytesIO:
-    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=SAMPLE_RATE, mono=True)
+def denoise_audio_bytes(audio_bytes: bytes, filename: str | None = None) -> io.BytesIO:
+    y, sr = decode_audio_bytes(audio_bytes, filename)
     if y.size == 0:
         raise ValueError("Empty or invalid audio")
 
@@ -126,7 +153,7 @@ async def predict(file: UploadFile = File(...)) -> dict:
 
     try:
         audio = await file.read()
-        x = preprocess_audio_bytes(audio)
+        x = preprocess_audio_bytes(audio, file.filename)
 
         pred = model.predict(x, verbose=0)
         pred = np.squeeze(pred)
@@ -158,7 +185,7 @@ async def predict(file: UploadFile = File(...)) -> dict:
 async def denoise(file: UploadFile = File(...)) -> StreamingResponse:
     try:
         audio = await file.read()
-        wav_buffer = denoise_audio_bytes(audio)
+        wav_buffer = denoise_audio_bytes(audio, file.filename)
         return StreamingResponse(
             wav_buffer,
             media_type="audio/wav",
