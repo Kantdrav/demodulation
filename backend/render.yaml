@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: audio-classification-api
+    env: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MODEL_PATH
+        value: model.h5
+      - key: MODEL_CONFIG_PATH
+        value: model_config.json
