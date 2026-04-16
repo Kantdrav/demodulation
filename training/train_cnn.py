@@ -47,6 +47,78 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Optional cap for quick experiments; 0 means all files",
     )
+    parser.add_argument(
+        "--augment-copies",
+        type=int,
+        default=0,
+        help="Number of augmented copies to generate per source file (0 disables augmentation)",
+    )
+    parser.add_argument(
+        "--augment-noise-min-snr-db",
+        type=float,
+        default=8.0,
+        help="Minimum SNR in dB for additive Gaussian noise augmentation",
+    )
+    parser.add_argument(
+        "--augment-noise-max-snr-db",
+        type=float,
+        default=20.0,
+        help="Maximum SNR in dB for additive Gaussian noise augmentation",
+    )
+    parser.add_argument(
+        "--augment-gain-min-db",
+        type=float,
+        default=-4.0,
+        help="Minimum random gain in dB for augmentation",
+    )
+    parser.add_argument(
+        "--augment-gain-max-db",
+        type=float,
+        default=4.0,
+        help="Maximum random gain in dB for augmentation",
+    )
+    parser.add_argument(
+        "--augment-shift-max-fraction",
+        type=float,
+        default=0.1,
+        help="Maximum circular time shift as fraction of waveform length",
+    )
+    parser.add_argument(
+        "--noisy-eval-copies",
+        type=int,
+        default=1,
+        help="Number of noisy copies per validation/test source file for robustness evaluation (0 disables)",
+    )
+    parser.add_argument(
+        "--noisy-eval-noise-min-snr-db",
+        type=float,
+        default=5.0,
+        help="Minimum SNR in dB for noisy validation/test evaluation",
+    )
+    parser.add_argument(
+        "--noisy-eval-noise-max-snr-db",
+        type=float,
+        default=15.0,
+        help="Maximum SNR in dB for noisy validation/test evaluation",
+    )
+    parser.add_argument(
+        "--noisy-eval-gain-min-db",
+        type=float,
+        default=-3.0,
+        help="Minimum random gain in dB for noisy validation/test evaluation",
+    )
+    parser.add_argument(
+        "--noisy-eval-gain-max-db",
+        type=float,
+        default=3.0,
+        help="Maximum random gain in dB for noisy validation/test evaluation",
+    )
+    parser.add_argument(
+        "--noisy-eval-shift-max-fraction",
+        type=float,
+        default=0.05,
+        help="Maximum circular time shift fraction for noisy validation/test evaluation",
+    )
     return parser.parse_args()
 
 
@@ -97,10 +169,77 @@ def extract_mfcc(
     y, sr = librosa.load(path, sr=sample_rate, mono=True)
     if y.size == 0:
         raise ValueError("Invalid or empty audio")
+    return extract_mfcc_from_waveform(
+        y=y,
+        sr=sr,
+        n_mfcc=n_mfcc,
+        max_len=max_len,
+        apply_lowpass=apply_lowpass,
+        lowpass_cutoff_hz=lowpass_cutoff_hz,
+    )
+
+
+def extract_mfcc_from_waveform(
+    y: np.ndarray,
+    sr: int,
+    n_mfcc: int,
+    max_len: int,
+    apply_lowpass: bool,
+    lowpass_cutoff_hz: float,
+) -> np.ndarray:
     if apply_lowpass:
         y = lowpass_filter_audio(y, sr, lowpass_cutoff_hz)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
     return pad_or_truncate(mfcc, max_len)
+
+
+def add_noise_at_snr(y: np.ndarray, snr_db: float, rng: np.random.Generator) -> np.ndarray:
+    signal_power = float(np.mean(np.square(y)))
+    if signal_power <= 0:
+        return np.asarray(y, dtype=np.float32)
+
+    noise_power = signal_power / (10 ** (snr_db / 10.0))
+    noise = rng.normal(0.0, np.sqrt(noise_power), size=y.shape)
+    return np.asarray(y + noise, dtype=np.float32)
+
+
+def apply_gain(y: np.ndarray, gain_db: float) -> np.ndarray:
+    gain = 10 ** (gain_db / 20.0)
+    return np.asarray(y * gain, dtype=np.float32)
+
+
+def apply_time_shift(y: np.ndarray, max_shift_fraction: float, rng: np.random.Generator) -> np.ndarray:
+    if y.size == 0 or max_shift_fraction <= 0:
+        return np.asarray(y, dtype=np.float32)
+    max_shift = int(max(1, round(y.size * max_shift_fraction)))
+    shift = int(rng.integers(-max_shift, max_shift + 1))
+    return np.asarray(np.roll(y, shift), dtype=np.float32)
+
+
+def augment_waveform(
+    y: np.ndarray,
+    rng: np.random.Generator,
+    noise_min_snr_db: float,
+    noise_max_snr_db: float,
+    gain_min_db: float,
+    gain_max_db: float,
+    shift_max_fraction: float,
+) -> np.ndarray:
+    augmented = np.asarray(y, dtype=np.float32)
+
+    snr_db = float(rng.uniform(noise_min_snr_db, noise_max_snr_db))
+    augmented = add_noise_at_snr(augmented, snr_db=snr_db, rng=rng)
+
+    gain_db = float(rng.uniform(gain_min_db, gain_max_db))
+    augmented = apply_gain(augmented, gain_db=gain_db)
+
+    augmented = apply_time_shift(augmented, max_shift_fraction=shift_max_fraction, rng=rng)
+
+    peak = np.max(np.abs(augmented)) if augmented.size else 0.0
+    if peak > 1.0:
+        augmented = augmented / peak
+
+    return np.asarray(augmented, dtype=np.float32)
 
 
 def build_model(n_mfcc: int, max_len: int, num_classes: int) -> tf.keras.Model:
@@ -272,6 +411,77 @@ def evaluate_split(
     }
 
 
+def build_feature_set(
+    records: list[tuple[Path, int]],
+    sample_rate: int,
+    n_mfcc: int,
+    max_len: int,
+    apply_lowpass: bool,
+    lowpass_cutoff_hz: float,
+    augment_copies: int,
+    rng: np.random.Generator,
+    noise_min_snr_db: float,
+    noise_max_snr_db: float,
+    gain_min_db: float,
+    gain_max_db: float,
+    shift_max_fraction: float,
+    include_clean: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    features: list[np.ndarray] = []
+    labels: list[int] = []
+
+    for audio_path, class_idx in records:
+        try:
+            y_audio, sr = librosa.load(audio_path, sr=sample_rate, mono=True)
+            if y_audio.size == 0:
+                raise ValueError("Invalid or empty audio")
+
+            if include_clean:
+                mfcc = extract_mfcc_from_waveform(
+                    y=y_audio,
+                    sr=sr,
+                    n_mfcc=n_mfcc,
+                    max_len=max_len,
+                    apply_lowpass=apply_lowpass,
+                    lowpass_cutoff_hz=lowpass_cutoff_hz,
+                )
+                features.append(mfcc)
+                labels.append(class_idx)
+
+            for _ in range(augment_copies):
+                y_aug = augment_waveform(
+                    y_audio,
+                    rng=rng,
+                    noise_min_snr_db=noise_min_snr_db,
+                    noise_max_snr_db=noise_max_snr_db,
+                    gain_min_db=gain_min_db,
+                    gain_max_db=gain_max_db,
+                    shift_max_fraction=shift_max_fraction,
+                )
+                mfcc_aug = extract_mfcc_from_waveform(
+                    y=y_aug,
+                    sr=sr,
+                    n_mfcc=n_mfcc,
+                    max_len=max_len,
+                    apply_lowpass=apply_lowpass,
+                    lowpass_cutoff_hz=lowpass_cutoff_hz,
+                )
+                features.append(mfcc_aug)
+                labels.append(class_idx)
+        except Exception as exc:
+            print(f"Skipping {audio_path}: {exc}")
+
+    if not features:
+        x_out = np.empty((0, n_mfcc, max_len, 1), dtype=np.float32)
+        y_out = np.empty((0,), dtype=np.int32)
+        return x_out, y_out
+
+    x_out = np.asarray(features, dtype=np.float32)
+    x_out = np.expand_dims(x_out, axis=-1)
+    y_out = np.asarray(labels, dtype=np.int32)
+    return x_out, y_out
+
+
 def main() -> None:
     args = parse_args()
     if not 0 <= args.val_ratio < 1:
@@ -280,6 +490,22 @@ def main() -> None:
         raise ValueError("--test-ratio must be in [0, 1)")
     if args.val_ratio + args.test_ratio >= 1:
         raise ValueError("--val-ratio + --test-ratio must be < 1")
+    if args.augment_copies < 0:
+        raise ValueError("--augment-copies must be >= 0")
+    if args.augment_noise_min_snr_db > args.augment_noise_max_snr_db:
+        raise ValueError("--augment-noise-min-snr-db must be <= --augment-noise-max-snr-db")
+    if args.augment_gain_min_db > args.augment_gain_max_db:
+        raise ValueError("--augment-gain-min-db must be <= --augment-gain-max-db")
+    if not 0 <= args.augment_shift_max_fraction <= 1:
+        raise ValueError("--augment-shift-max-fraction must be in [0, 1]")
+    if args.noisy_eval_copies < 0:
+        raise ValueError("--noisy-eval-copies must be >= 0")
+    if args.noisy_eval_noise_min_snr_db > args.noisy_eval_noise_max_snr_db:
+        raise ValueError("--noisy-eval-noise-min-snr-db must be <= --noisy-eval-noise-max-snr-db")
+    if args.noisy_eval_gain_min_db > args.noisy_eval_gain_max_db:
+        raise ValueError("--noisy-eval-gain-min-db must be <= --noisy-eval-gain-max-db")
+    if not 0 <= args.noisy_eval_shift_max_fraction <= 1:
+        raise ValueError("--noisy-eval-shift-max-fraction must be in [0, 1]")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -288,13 +514,13 @@ def main() -> None:
     dataset_dir = Path(args.dataset_dir)
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Dataset path not found: {dataset_dir}")
+    rng = np.random.default_rng(args.seed)
 
     class_dirs = list_class_dirs(dataset_dir)
     class_names = [p.name for p in class_dirs]
     print(f"Classes: {class_names}")
 
-    features = []
-    labels = []
+    records: list[tuple[Path, int]] = []
 
     for class_idx, class_dir in enumerate(class_dirs):
         files = collect_audio_files(class_dir)
@@ -304,36 +530,20 @@ def main() -> None:
         if not files:
             raise ValueError(f"No audio files found under class folder: {class_dir}")
 
-        print(f"Loading {len(files)} files from {class_dir.name}")
+        print(f"Found {len(files)} files in {class_dir.name}")
         for audio_path in files:
-            try:
-                mfcc = extract_mfcc(
-                    audio_path,
-                    args.sample_rate,
-                    args.n_mfcc,
-                    args.max_len,
-                    apply_lowpass=not args.disable_lowpass,
-                    lowpass_cutoff_hz=args.lowpass_cutoff_hz,
-                )
-                features.append(mfcc)
-                labels.append(class_idx)
-            except Exception as exc:
-                print(f"Skipping {audio_path}: {exc}")
+            records.append((audio_path, class_idx))
 
-    if not features:
-        raise ValueError("No usable audio files found after preprocessing")
+    if not records:
+        raise ValueError("No usable audio files found after dataset scan")
 
-    x = np.array(features, dtype=np.float32)
-    y = np.array(labels, dtype=np.int32)
-
-    x = np.expand_dims(x, axis=-1)
-    print(f"Feature shape: {x.shape}")
+    labels_array = np.array([class_idx for _, class_idx in records], dtype=np.int32)
 
     train_idx = []
     val_idx = []
     test_idx = []
     for class_idx in range(len(class_names)):
-        cls_indices = np.where(y == class_idx)[0].tolist()
+        cls_indices = np.where(labels_array == class_idx)[0].tolist()
         tr, va, te = train_val_test_split(
             cls_indices,
             args.val_ratio,
@@ -344,21 +554,83 @@ def main() -> None:
         val_idx.extend(va)
         test_idx.extend(te)
 
-    x_train, y_train = x[train_idx], y[train_idx]
-    x_val, y_val = x[val_idx], y[val_idx]
-    x_test, y_test = x[test_idx], y[test_idx]
+    train_records = [records[i] for i in train_idx]
+    val_records = [records[i] for i in val_idx]
+    test_records = [records[i] for i in test_idx]
 
-    print(f"Train samples: {len(x_train)}")
-    print(f"Validation samples: {len(x_val)}")
-    print(f"Test samples: {len(x_test)}")
+    x_train, y_train = build_feature_set(
+        records=train_records,
+        sample_rate=args.sample_rate,
+        n_mfcc=args.n_mfcc,
+        max_len=args.max_len,
+        apply_lowpass=not args.disable_lowpass,
+        lowpass_cutoff_hz=args.lowpass_cutoff_hz,
+        augment_copies=args.augment_copies,
+        rng=rng,
+        noise_min_snr_db=args.augment_noise_min_snr_db,
+        noise_max_snr_db=args.augment_noise_max_snr_db,
+        gain_min_db=args.augment_gain_min_db,
+        gain_max_db=args.augment_gain_max_db,
+        shift_max_fraction=args.augment_shift_max_fraction,
+        include_clean=True,
+    )
+    x_val, y_val = build_feature_set(
+        records=val_records,
+        sample_rate=args.sample_rate,
+        n_mfcc=args.n_mfcc,
+        max_len=args.max_len,
+        apply_lowpass=not args.disable_lowpass,
+        lowpass_cutoff_hz=args.lowpass_cutoff_hz,
+        augment_copies=0,
+        rng=rng,
+        noise_min_snr_db=args.augment_noise_min_snr_db,
+        noise_max_snr_db=args.augment_noise_max_snr_db,
+        gain_min_db=args.augment_gain_min_db,
+        gain_max_db=args.augment_gain_max_db,
+        shift_max_fraction=args.augment_shift_max_fraction,
+        include_clean=True,
+    )
+    x_test, y_test = build_feature_set(
+        records=test_records,
+        sample_rate=args.sample_rate,
+        n_mfcc=args.n_mfcc,
+        max_len=args.max_len,
+        apply_lowpass=not args.disable_lowpass,
+        lowpass_cutoff_hz=args.lowpass_cutoff_hz,
+        augment_copies=0,
+        rng=rng,
+        noise_min_snr_db=args.augment_noise_min_snr_db,
+        noise_max_snr_db=args.augment_noise_max_snr_db,
+        gain_min_db=args.augment_gain_min_db,
+        gain_max_db=args.augment_gain_max_db,
+        shift_max_fraction=args.augment_shift_max_fraction,
+        include_clean=True,
+    )
+
+    print(f"Train source files: {len(train_records)}")
+    print(f"Validation source files: {len(val_records)}")
+    print(f"Test source files: {len(test_records)}")
+    print(f"Train feature samples (after augmentation): {len(x_train)}")
+    print(f"Validation feature samples: {len(x_val)}")
+    print(f"Test feature samples: {len(x_test)}")
 
     if len(x_val) == 0:
         raise ValueError("Validation split is empty. Increase dataset size or --val-ratio.")
 
     model = build_model(args.n_mfcc, args.max_len, len(class_names))
 
+    artifacts_dir = Path(args.artifacts_dir)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
     callbacks = [
         tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=artifacts_dir / "best_model.keras",
+            monitor="val_loss",
+            save_best_only=True,
+            verbose=1,
+        ),
     ]
 
     history = model.fit(
@@ -386,11 +658,62 @@ def main() -> None:
     }
     output_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    artifacts_dir = Path(args.artifacts_dir)
     save_training_curves(history, artifacts_dir)
 
     val_metrics = evaluate_split(model, x_val, y_val, class_names, artifacts_dir, "validation")
     test_metrics = evaluate_split(model, x_test, y_test, class_names, artifacts_dir, "test")
+
+    noisy_val_metrics = None
+    noisy_test_metrics = None
+    if args.noisy_eval_copies > 0:
+        x_val_noisy, y_val_noisy = build_feature_set(
+            records=val_records,
+            sample_rate=args.sample_rate,
+            n_mfcc=args.n_mfcc,
+            max_len=args.max_len,
+            apply_lowpass=not args.disable_lowpass,
+            lowpass_cutoff_hz=args.lowpass_cutoff_hz,
+            augment_copies=args.noisy_eval_copies,
+            rng=rng,
+            noise_min_snr_db=args.noisy_eval_noise_min_snr_db,
+            noise_max_snr_db=args.noisy_eval_noise_max_snr_db,
+            gain_min_db=args.noisy_eval_gain_min_db,
+            gain_max_db=args.noisy_eval_gain_max_db,
+            shift_max_fraction=args.noisy_eval_shift_max_fraction,
+            include_clean=False,
+        )
+        x_test_noisy, y_test_noisy = build_feature_set(
+            records=test_records,
+            sample_rate=args.sample_rate,
+            n_mfcc=args.n_mfcc,
+            max_len=args.max_len,
+            apply_lowpass=not args.disable_lowpass,
+            lowpass_cutoff_hz=args.lowpass_cutoff_hz,
+            augment_copies=args.noisy_eval_copies,
+            rng=rng,
+            noise_min_snr_db=args.noisy_eval_noise_min_snr_db,
+            noise_max_snr_db=args.noisy_eval_noise_max_snr_db,
+            gain_min_db=args.noisy_eval_gain_min_db,
+            gain_max_db=args.noisy_eval_gain_max_db,
+            shift_max_fraction=args.noisy_eval_shift_max_fraction,
+            include_clean=False,
+        )
+        noisy_val_metrics = evaluate_split(
+            model,
+            x_val_noisy,
+            y_val_noisy,
+            class_names,
+            artifacts_dir,
+            "validation_noisy",
+        )
+        noisy_test_metrics = evaluate_split(
+            model,
+            x_test_noisy,
+            y_test_noisy,
+            class_names,
+            artifacts_dir,
+            "test_noisy",
+        )
 
     metrics_summary = {
         "seed": args.seed,
@@ -399,8 +722,22 @@ def main() -> None:
         "max_len": args.max_len,
         "lowpass_enabled": not args.disable_lowpass,
         "lowpass_cutoff_hz": args.lowpass_cutoff_hz,
+        "augment_copies": args.augment_copies,
+        "augment_noise_min_snr_db": args.augment_noise_min_snr_db,
+        "augment_noise_max_snr_db": args.augment_noise_max_snr_db,
+        "augment_gain_min_db": args.augment_gain_min_db,
+        "augment_gain_max_db": args.augment_gain_max_db,
+        "augment_shift_max_fraction": args.augment_shift_max_fraction,
+        "noisy_eval_copies": args.noisy_eval_copies,
+        "noisy_eval_noise_min_snr_db": args.noisy_eval_noise_min_snr_db,
+        "noisy_eval_noise_max_snr_db": args.noisy_eval_noise_max_snr_db,
+        "noisy_eval_gain_min_db": args.noisy_eval_gain_min_db,
+        "noisy_eval_gain_max_db": args.noisy_eval_gain_max_db,
+        "noisy_eval_shift_max_fraction": args.noisy_eval_shift_max_fraction,
         "validation": val_metrics,
         "test": test_metrics,
+        "validation_noisy": noisy_val_metrics,
+        "test_noisy": noisy_test_metrics,
     }
     (artifacts_dir / "metrics_summary.json").write_text(
         json.dumps(metrics_summary, indent=2),
@@ -412,6 +749,8 @@ def main() -> None:
     print(f"Saved training artifacts to: {artifacts_dir}")
     print(f"Validation metrics: {val_metrics}")
     print(f"Test metrics: {test_metrics}")
+    print(f"Validation noisy metrics: {noisy_val_metrics}")
+    print(f"Test noisy metrics: {noisy_test_metrics}")
 
 
 if __name__ == "__main__":

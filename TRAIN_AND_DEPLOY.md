@@ -25,6 +25,8 @@ cd /home/kantdravi/Desktop/Demod
   --output-config backend/model_config.json \
   --test-ratio 0.1 \
   --lowpass-cutoff-hz 8000 \
+  --augment-copies 1 \
+  --noisy-eval-copies 1 \
   --epochs 20 \
   --batch-size 16
 ```
@@ -41,6 +43,8 @@ cd /home/kantdravi/Desktop/Demod
   --lowpass-cutoff-hz 8000 \
   --epochs 2 \
   --batch-size 8 \
+  --augment-copies 1 \
+  --noisy-eval-copies 1 \
   --max-files-per-class 30
 
 Generated evaluation artifacts now include separate validation and test outputs:
@@ -48,6 +52,10 @@ Generated evaluation artifacts now include separate validation and test outputs:
 - `training/artifacts/classification_report_test.txt`
 - `training/artifacts/confusion_matrix_validation.csv`
 - `training/artifacts/confusion_matrix_test.csv`
+- `training/artifacts/classification_report_validation_noisy.txt`
+- `training/artifacts/classification_report_test_noisy.txt`
+- `training/artifacts/confusion_matrix_validation_noisy.csv`
+- `training/artifacts/confusion_matrix_test_noisy.csv`
 - `training/artifacts/metrics_summary.json`
 ```
 
@@ -72,7 +80,13 @@ curl http://127.0.0.1:8000/health
 4. Render uses backend/render.yaml automatically.
 5. Ensure backend/model.h5 and backend/model_config.json exist in repo (or download them during build).
 
-## 5) Connect Flutter
+## 5) Enable auto deploy from GitHub Actions
+
+1. In Render Web Service settings, copy the Deploy Hook URL.
+2. In GitHub repo settings, add secret: `RENDER_DEPLOY_HOOK_URL` with that value.
+3. The workflow in `.github/workflows/render-auto-deploy.yml` now triggers deploy on pushes to main for backend/training changes.
+
+## 6) Connect Flutter
 
 Set your API URL in flutter_app/lib/main.dart.
 

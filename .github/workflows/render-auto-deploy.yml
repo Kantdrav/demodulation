@@ -1,0 +1,26 @@
+name: Render Auto Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - backend/**
+      - training/**
+      - .github/workflows/render-auto-deploy.yml
+      - TRAIN_AND_DEPLOY.md
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "Missing GitHub secret: RENDER_DEPLOY_HOOK_URL"
+            exit 1
+          fi
+          curl --fail --show-error --silent -X POST "$RENDER_DEPLOY_HOOK_URL"
