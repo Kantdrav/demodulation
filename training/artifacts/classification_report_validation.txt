@@ -1,0 +1,8 @@
+                                   precision    recall  f1-score   support
+
+Hospital noise filtered resampled     1.0000    1.0000    1.0000       112
+          Hospital noise original     1.0000    1.0000    1.0000       112
+
+                         accuracy                         1.0000       224
+                        macro avg     1.0000    1.0000    1.0000       224
+                     weighted avg     1.0000    1.0000    1.0000       224

@@ -2,6 +2,7 @@
   "sample_rate": 22050,
   "n_mfcc": 40,
   "max_len": 173,
+  "lowpass_cutoff_hz": 8000.0,
   "class_names": [
     "Hospital noise filtered resampled",
     "Hospital noise original"

@@ -23,7 +23,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--lowpass-cutoff-hz",
+        type=float,
+        default=8000.0,
+        help="Low-pass cutoff frequency used before MFCC extraction",
+    )
+    parser.add_argument(
+        "--disable-lowpass",
+        action="store_true",
+        help="Disable low-pass preprocessing (enabled by default)",
+    )
     parser.add_argument(
         "--artifacts-dir",
         default="training/artifacts",
@@ -58,10 +70,35 @@ def pad_or_truncate(mfcc: np.ndarray, max_len: int) -> np.ndarray:
     return mfcc
 
 
-def extract_mfcc(path: Path, sample_rate: int, n_mfcc: int, max_len: int) -> np.ndarray:
+def lowpass_filter_audio(y: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
+    if y.size == 0:
+        return y
+
+    nyquist = sr / 2.0
+    effective_cutoff = max(1.0, min(float(cutoff_hz), nyquist * 0.95))
+    if effective_cutoff >= nyquist:
+        return np.asarray(y, dtype=np.float32)
+
+    spectrum = np.fft.rfft(y)
+    frequencies = np.fft.rfftfreq(len(y), d=1.0 / sr)
+    spectrum[frequencies > effective_cutoff] = 0
+    filtered = np.fft.irfft(spectrum, n=len(y))
+    return np.asarray(filtered, dtype=np.float32)
+
+
+def extract_mfcc(
+    path: Path,
+    sample_rate: int,
+    n_mfcc: int,
+    max_len: int,
+    apply_lowpass: bool,
+    lowpass_cutoff_hz: float,
+) -> np.ndarray:
     y, sr = librosa.load(path, sr=sample_rate, mono=True)
     if y.size == 0:
         raise ValueError("Invalid or empty audio")
+    if apply_lowpass:
+        y = lowpass_filter_audio(y, sr, lowpass_cutoff_hz)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
     return pad_or_truncate(mfcc, max_len)
 
@@ -90,13 +127,39 @@ def build_model(n_mfcc: int, max_len: int, num_classes: int) -> tf.keras.Model:
     return model
 
 
-def train_val_split(indices: list[int], val_ratio: float, seed: int) -> tuple[list[int], list[int]]:
+def train_val_test_split(
+    indices: list[int],
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> tuple[list[int], list[int], list[int]]:
     rnd = random.Random(seed)
     shuffled = indices[:]
     rnd.shuffle(shuffled)
-    split = max(1, int(len(shuffled) * (1 - val_ratio)))
-    split = min(split, len(shuffled) - 1)
-    return shuffled[:split], shuffled[split:]
+
+    n = len(shuffled)
+    if n <= 1:
+        return shuffled, [], []
+
+    val_count = int(round(n * val_ratio)) if val_ratio > 0 else 0
+    test_count = int(round(n * test_ratio)) if test_ratio > 0 else 0
+
+    if test_ratio > 0 and n >= 3 and test_count == 0:
+        test_count = 1
+    if val_ratio > 0 and n - test_count >= 2 and val_count == 0:
+        val_count = 1
+
+    max_non_train = n - 1
+    if val_count + test_count > max_non_train:
+        overflow = val_count + test_count - max_non_train
+        reduce_val = min(val_count, overflow)
+        val_count -= reduce_val
+        overflow -= reduce_val
+        test_count = max(0, test_count - overflow)
+
+    train_end = n - (val_count + test_count)
+    val_end = n - test_count
+    return shuffled[:train_end], shuffled[train_end:val_end], shuffled[val_end:]
 
 
 def save_training_curves(history: tf.keras.callbacks.History, artifacts_dir: Path) -> None:
@@ -138,13 +201,15 @@ def save_confusion_matrix_artifacts(
     y_pred: np.ndarray,
     class_names: list[str],
     artifacts_dir: Path,
+    split_name: str,
 ) -> None:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = split_name.lower().replace(" ", "_")
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
-    np.savetxt(artifacts_dir / "confusion_matrix.csv", cm, delimiter=",", fmt="%d")
+    np.savetxt(artifacts_dir / f"confusion_matrix_{safe_name}.csv", cm, delimiter=",", fmt="%d")
 
-    report = classification_report(y_true, y_pred, target_names=class_names, digits=4)
-    (artifacts_dir / "classification_report.txt").write_text(report, encoding="utf-8")
+    report = classification_report(y_true, y_pred, target_names=class_names, digits=4, zero_division=0)
+    (artifacts_dir / f"classification_report_{safe_name}.txt").write_text(report, encoding="utf-8")
 
     fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
@@ -156,7 +221,7 @@ def save_confusion_matrix_artifacts(
         yticklabels=class_names,
         ylabel="True label",
         xlabel="Predicted label",
-        title="Confusion Matrix (Validation Set)",
+        title=f"Confusion Matrix ({split_name.title()} Set)",
     )
     plt.setp(ax.get_xticklabels(), rotation=25, ha="right", rotation_mode="anchor")
 
@@ -172,12 +237,50 @@ def save_confusion_matrix_artifacts(
                 color="white" if cm[i, j] > thresh else "black",
             )
     fig.tight_layout()
-    fig.savefig(artifacts_dir / "confusion_matrix.png", dpi=150)
+    fig.savefig(artifacts_dir / f"confusion_matrix_{safe_name}.png", dpi=150)
     plt.close(fig)
+
+
+def evaluate_split(
+    model: tf.keras.Model,
+    x_data: np.ndarray,
+    y_data: np.ndarray,
+    class_names: list[str],
+    artifacts_dir: Path,
+    split_name: str,
+) -> dict:
+    if len(y_data) == 0:
+        return {"samples": 0, "accuracy": None, "macro_f1": None, "weighted_f1": None}
+
+    y_pred_prob = model.predict(x_data, verbose=0)
+    y_pred = np.argmax(y_pred_prob, axis=1)
+    save_confusion_matrix_artifacts(y_data, y_pred, class_names, artifacts_dir, split_name)
+
+    report_dict = classification_report(
+        y_data,
+        y_pred,
+        target_names=class_names,
+        digits=4,
+        output_dict=True,
+        zero_division=0,
+    )
+    return {
+        "samples": int(len(y_data)),
+        "accuracy": float(np.mean(y_pred == y_data)),
+        "macro_f1": float(report_dict["macro avg"]["f1-score"]),
+        "weighted_f1": float(report_dict["weighted avg"]["f1-score"]),
+    }
 
 
 def main() -> None:
     args = parse_args()
+    if not 0 <= args.val_ratio < 1:
+        raise ValueError("--val-ratio must be in [0, 1)")
+    if not 0 <= args.test_ratio < 1:
+        raise ValueError("--test-ratio must be in [0, 1)")
+    if args.val_ratio + args.test_ratio >= 1:
+        raise ValueError("--val-ratio + --test-ratio must be < 1")
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
@@ -204,7 +307,14 @@ def main() -> None:
         print(f"Loading {len(files)} files from {class_dir.name}")
         for audio_path in files:
             try:
-                mfcc = extract_mfcc(audio_path, args.sample_rate, args.n_mfcc, args.max_len)
+                mfcc = extract_mfcc(
+                    audio_path,
+                    args.sample_rate,
+                    args.n_mfcc,
+                    args.max_len,
+                    apply_lowpass=not args.disable_lowpass,
+                    lowpass_cutoff_hz=args.lowpass_cutoff_hz,
+                )
                 features.append(mfcc)
                 labels.append(class_idx)
             except Exception as exc:
@@ -221,17 +331,29 @@ def main() -> None:
 
     train_idx = []
     val_idx = []
+    test_idx = []
     for class_idx in range(len(class_names)):
         cls_indices = np.where(y == class_idx)[0].tolist()
-        tr, va = train_val_split(cls_indices, args.val_ratio, args.seed)
+        tr, va, te = train_val_test_split(
+            cls_indices,
+            args.val_ratio,
+            args.test_ratio,
+            args.seed + class_idx,
+        )
         train_idx.extend(tr)
         val_idx.extend(va)
+        test_idx.extend(te)
 
     x_train, y_train = x[train_idx], y[train_idx]
     x_val, y_val = x[val_idx], y[val_idx]
+    x_test, y_test = x[test_idx], y[test_idx]
 
     print(f"Train samples: {len(x_train)}")
     print(f"Validation samples: {len(x_val)}")
+    print(f"Test samples: {len(x_test)}")
+
+    if len(x_val) == 0:
+        raise ValueError("Validation split is empty. Increase dataset size or --val-ratio.")
 
     model = build_model(args.n_mfcc, args.max_len, len(class_names))
 
@@ -259,19 +381,37 @@ def main() -> None:
         "sample_rate": args.sample_rate,
         "n_mfcc": args.n_mfcc,
         "max_len": args.max_len,
+        "lowpass_cutoff_hz": None if args.disable_lowpass else args.lowpass_cutoff_hz,
         "class_names": class_names,
     }
     output_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    y_pred_prob = model.predict(x_val, verbose=0)
-    y_pred = np.argmax(y_pred_prob, axis=1)
     artifacts_dir = Path(args.artifacts_dir)
     save_training_curves(history, artifacts_dir)
-    save_confusion_matrix_artifacts(y_val, y_pred, class_names, artifacts_dir)
+
+    val_metrics = evaluate_split(model, x_val, y_val, class_names, artifacts_dir, "validation")
+    test_metrics = evaluate_split(model, x_test, y_test, class_names, artifacts_dir, "test")
+
+    metrics_summary = {
+        "seed": args.seed,
+        "sample_rate": args.sample_rate,
+        "n_mfcc": args.n_mfcc,
+        "max_len": args.max_len,
+        "lowpass_enabled": not args.disable_lowpass,
+        "lowpass_cutoff_hz": args.lowpass_cutoff_hz,
+        "validation": val_metrics,
+        "test": test_metrics,
+    }
+    (artifacts_dir / "metrics_summary.json").write_text(
+        json.dumps(metrics_summary, indent=2),
+        encoding="utf-8",
+    )
 
     print(f"Saved model to: {output_model}")
     print(f"Saved config to: {output_config}")
     print(f"Saved training artifacts to: {artifacts_dir}")
+    print(f"Validation metrics: {val_metrics}")
+    print(f"Test metrics: {test_metrics}")
 
 
 if __name__ == "__main__":
