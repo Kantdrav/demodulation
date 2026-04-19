@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -49,6 +51,7 @@ SAMPLE_RATE = int(MODEL_CONFIG["sample_rate"])
 N_MFCC = int(MODEL_CONFIG["n_mfcc"])
 MAX_LEN = int(MODEL_CONFIG["max_len"])
 LOWPASS_CUTOFF_HZ = float(os.getenv("LOWPASS_CUTOFF_HZ", "8000"))
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 app = FastAPI(title="Audio Classification API")
 
@@ -113,11 +116,65 @@ def decode_audio_bytes(audio_bytes: bytes, filename: str | None = None) -> tuple
         return librosa.load(temp_path, sr=SAMPLE_RATE, mono=True)
     except Exception as exc:
         raise ValueError(
-            "Unsupported or corrupted audio format. Upload WAV/MP3/M4A/FLAC/OGG."
+            "Unsupported or corrupted audio format. Upload WAV/MP3/M4A/FLAC/OGG or video with audio track (MP4/MOV/MKV/AVI/WEBM)."
         ) from exc
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def _extract_audio_from_video_bytes(video_bytes: bytes, filename: str | None = None) -> bytes:
+    if not shutil.which("ffmpeg"):
+        raise ValueError("Video input requires ffmpeg on server, but ffmpeg was not found")
+
+    input_suffix = Path(filename or "video.mp4").suffix.lower() or ".mp4"
+    input_path: str | None = None
+    output_path: str | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=input_suffix, delete=False) as in_tmp:
+            in_tmp.write(video_bytes)
+            input_path = in_tmp.name
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_tmp:
+            output_path = out_tmp.name
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-acodec",
+            "pcm_s16le",
+            output_path,
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        if completed.returncode != 0:
+            ffmpeg_error = (completed.stderr or completed.stdout or "Unknown ffmpeg error").strip()
+            raise ValueError(f"Failed to extract audio from video: {ffmpeg_error}")
+
+        with open(output_path, "rb") as fh:
+            return fh.read()
+    finally:
+        if input_path and os.path.exists(input_path):
+            os.remove(input_path)
+        if output_path and os.path.exists(output_path):
+            os.remove(output_path)
+
+
+def normalize_upload_to_audio_bytes(file_bytes: bytes, filename: str | None = None) -> bytes:
+    if not file_bytes:
+        raise ValueError("Empty or invalid file")
+
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        return _extract_audio_from_video_bytes(file_bytes, filename)
+    return file_bytes
 
 
 def preprocess_audio_bytes(audio_bytes: bytes, filename: str | None = None) -> np.ndarray:
@@ -265,7 +322,8 @@ async def predict(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=500, detail="Model not loaded")
 
     try:
-        audio = await file.read()
+        uploaded_bytes = await file.read()
+        audio = normalize_upload_to_audio_bytes(uploaded_bytes, file.filename)
         x = preprocess_audio_bytes(audio, file.filename)
 
         pred = model.predict(x, verbose=0)
@@ -297,7 +355,8 @@ async def predict(file: UploadFile = File(...)) -> dict:
 @app.post("/denoise")
 async def denoise(file: UploadFile = File(...)) -> StreamingResponse:
     try:
-        audio = await file.read()
+        uploaded_bytes = await file.read()
+        audio = normalize_upload_to_audio_bytes(uploaded_bytes, file.filename)
         wav_buffer = denoise_audio_bytes(audio, file.filename)
         return StreamingResponse(
             wav_buffer,
@@ -313,7 +372,8 @@ async def denoise(file: UploadFile = File(...)) -> StreamingResponse:
 @app.post("/denoise-auphonic")
 async def denoise_auphonic(file: UploadFile = File(...)) -> StreamingResponse:
     try:
-        audio = await file.read()
+        uploaded_bytes = await file.read()
+        audio = normalize_upload_to_audio_bytes(uploaded_bytes, file.filename)
         wav_buffer = denoise_audio_bytes_auphonic(audio, file.filename)
         return StreamingResponse(
             wav_buffer,
